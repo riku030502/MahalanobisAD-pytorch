@@ -3,16 +3,15 @@ import numpy as np
 import os
 import pickle
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score
-from sklearn.metrics import roc_curve
 from sklearn.covariance import LedoitWolf
 from scipy.spatial.distance import mahalanobis
 import matplotlib.pyplot as plt
-
+import torchvision.transforms.functional as TF
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from efficientnet_pytorch import EfficientNet
+import cv2
 
 import datasets.mvtec as mvtec
 
@@ -24,107 +23,47 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def denormalize(tensor, mean, std):
+    mean = torch.tensor(mean).view(-1, 1, 1)
+    std = torch.tensor(std).view(-1, 1, 1)
+    return tensor * std + mean
 
-    args = parse_args()
-    assert args.model_name.startswith('efficientnet-b'), 'only support efficientnet variants, not %s' % args.model_name
 
-    # device setup
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def generate_heatmap_overlay(image_tensor, anomaly_map, mean, std):
+    image = denormalize(image_tensor.clone(), mean, std)
+    image = torch.clamp(image, 0, 1)
+    image_np = np.transpose(image.numpy(), (1, 2, 0)) * 255
+    image_np = image_np.astype(np.uint8)
 
-    # load model
-    model = EfficientNetModified.from_pretrained(args.model_name)
-    model.to(device)
-    model.eval()
+    # アノマリーマップをリサイズ・正規化
+    anomaly_map_resized = cv2.resize(anomaly_map, (image_np.shape[1], image_np.shape[0]))
+    normalized_anomaly = (255 * (anomaly_map_resized - anomaly_map_resized.min()) / 
+                          (anomaly_map_resized.ptp() + 1e-6)).astype(np.uint8)
 
-    os.makedirs(os.path.join(args.save_path, 'temp'), exist_ok=True)
+    # スコアの計算（ここでは最大値を表示）
+    anomaly_score = anomaly_map_resized.max()
 
-    total_roc_auc = []
+    # ヒートマップ重ね合わせ
+    heatmap = cv2.applyColorMap(normalized_anomaly, cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(image_np, 0.6, heatmap, 0.4, 0)
 
-    for class_name in mvtec.CLASS_NAMES:
+    # スコアをテキストで描画
+    score_text = f"Score: {anomaly_score:.2f}"
+    cv2.putText(
+        overlay, score_text, org=(10, 30), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+        fontScale=1.0, color=(255, 255, 255), thickness=2, lineType=cv2.LINE_AA
+    )
 
-        train_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=32, pin_memory=True)
-        test_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=False)
-        test_dataloader = DataLoader(test_dataset, batch_size=32, pin_memory=True)
-
-        train_outputs = [[] for _ in range(9)]
-        test_outputs = [[] for _ in range(9)]
-
-        # extract train set features
-        train_feat_filepath = os.path.join(args.save_path, 'temp', 'train_%s_%s.pkl' % (class_name, args.model_name))
-        if not os.path.exists(train_feat_filepath):
-            for (x, y, mask) in tqdm(train_dataloader, '| feature extraction | train | %s |' % class_name):
-                # model prediction
-                with torch.no_grad():
-                    feats = model.extract_features(x.to(device))
-                for f_idx, feat in enumerate(feats):
-                    train_outputs[f_idx].append(feat)
-
-            # fitting a multivariate gaussian to features extracted from every level of ImageNet pre-trained model
-            for t_idx, train_output in enumerate(train_outputs):
-                mean = torch.mean(torch.cat(train_output, 0).squeeze(), dim=0).cpu().detach().numpy()
-                # covariance estimation by using the Ledoit. Wolf et al. method
-                cov = LedoitWolf().fit(torch.cat(train_output, 0).squeeze().cpu().detach().numpy()).covariance_
-                train_outputs[t_idx] = [mean, cov]
-
-            # save extracted feature
-            with open(train_feat_filepath, 'wb') as f:
-                pickle.dump(train_outputs, f)
-        else:
-            print('load train set feature distribution from: %s' % train_feat_filepath)
-            with open(train_feat_filepath, 'rb') as f:
-                train_outputs = pickle.load(f)
-
-        gt_list = []
-
-        # extract test set features
-        for (x, y, mask) in tqdm(test_dataloader, '| feature extraction | test | %s |' % class_name):
-            gt_list.extend(y.cpu().detach().numpy())
-            # model prediction
-            with torch.no_grad():
-                feats = model.extract_features(x.to(device))
-            for f_idx, feat in enumerate(feats):
-                test_outputs[f_idx].append(feat)
-        for t_idx, test_output in enumerate(test_outputs):
-            test_outputs[t_idx] = torch.cat(test_output, 0).squeeze().cpu().detach().numpy()
-
-        # calculate Mahalanobis distance per each level of EfficientNet
-        dist_list = []
-        for t_idx, test_output in enumerate(test_outputs):
-            mean = train_outputs[t_idx][0]
-            cov_inv = np.linalg.inv(train_outputs[t_idx][1])
-            dist = [mahalanobis(sample, mean, cov_inv) for sample in test_output]
-            dist_list.append(np.array(dist))
-
-        # Anomaly score is followed by unweighted summation of the Mahalanobis distances
-        scores = np.sum(np.array(dist_list), axis=0)
-
-        # calculate image-level ROC AUC score
-        fpr, tpr, _ = roc_curve(gt_list, scores)
-        roc_auc = roc_auc_score(gt_list, scores)
-        total_roc_auc.append(roc_auc)
-        print('%s ROCAUC: %.3f' % (class_name, roc_auc))
-        plt.plot(fpr, tpr, label='%s ROCAUC: %.3f' % (class_name, roc_auc))
-
-    print('Average ROCAUC: %.3f' % np.mean(total_roc_auc))
-    plt.title('Average image ROCAUC: %.3f' % np.mean(total_roc_auc))
-    plt.legend(loc='lower right')
-    plt.savefig(os.path.join(args.save_path, 'roc_curve_%s.png' % args.model_name), dpi=200)
+    return overlay
 
 
 class EfficientNetModified(EfficientNet):
-
-    def extract_features(self, inputs):
-        """ Returns list of the feature at each level of the EfficientNet """
-
+    def extract_features_spatial(self, inputs):
         feat_list = []
 
-        # Stem
         x = self._swish(self._bn0(self._conv_stem(inputs)))
-        feat_list.append(F.adaptive_avg_pool2d(x, 1))
+        feat_list.append(x)
 
-        # Blocks
         x_prev = x
         for idx, block in enumerate(self._blocks):
             drop_connect_rate = self._global_params.drop_connect_rate
@@ -132,15 +71,93 @@ class EfficientNetModified(EfficientNet):
                 drop_connect_rate *= float(idx) / len(self._blocks)
             x = block(x, drop_connect_rate=drop_connect_rate)
             if (x_prev.shape[1] != x.shape[1] and idx != 0) or idx == (len(self._blocks) - 1):
-                feat_list.append(F.adaptive_avg_pool2d(x_prev, 1))
+                feat_list.append(x_prev)
             x_prev = x
 
-        # Head
         x = self._swish(self._bn1(self._conv_head(x)))
-        feat_list.append(F.adaptive_avg_pool2d(x, 1))
+        feat_list.append(x)
 
-        return feat_list
+        return feat_list  # 各特徴マップ (B, C, H, W)
 
+
+def main():
+    args = parse_args()
+    assert args.model_name.startswith('efficientnet-b'), f'Only EfficientNet variants supported, not {args.model_name}'
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = EfficientNetModified.from_pretrained(args.model_name)
+    model.to(device)
+    model.eval()
+
+    os.makedirs(os.path.join(args.save_path, 'temp'), exist_ok=True)
+
+    imagenet_mean = [0.485, 0.456, 0.406]
+    imagenet_std = [0.229, 0.224, 0.225]
+
+    for class_name in mvtec.CLASS_NAMES:
+
+        train_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=True)
+        train_loader = DataLoader(train_dataset, batch_size=8, pin_memory=True)
+        test_dataset = mvtec.MVTecDataset(class_name=class_name, is_train=False)
+        test_loader = DataLoader(test_dataset, batch_size=1, pin_memory=True)
+
+        save_dir = os.path.join(args.save_path, 'heatmap_result', class_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        feature_stats = []
+        train_feat_path = os.path.join(args.save_path, 'temp', f'train_{class_name}_{args.model_name}_spatial.pkl')
+
+        if not os.path.exists(train_feat_path):
+            print(f"Extracting spatial features for training set of {class_name}")
+            all_feats = []
+
+            for x, _, _ in tqdm(train_loader):
+                with torch.no_grad():
+                    feats = model.extract_features_spatial(x.to(device))
+                all_feats.append([f.cpu().numpy() for f in feats])
+
+            num_levels = len(all_feats[0])
+            feature_stats = []
+
+            for level in range(num_levels):
+                spatial_feats = []
+                for batch in all_feats:
+                    f = batch[level]  # shape (B, C, H, W)
+                    B, C, H, W = f.shape
+                    spatial_feats.append(f.transpose(0, 2, 3, 1).reshape(-1, C))
+                spatial_feats = np.concatenate(spatial_feats, axis=0)
+
+                mean = np.mean(spatial_feats, axis=0)
+                cov = LedoitWolf().fit(spatial_feats).covariance_
+                feature_stats.append((mean, np.linalg.inv(cov)))
+
+            with open(train_feat_path, 'wb') as f:
+                pickle.dump(feature_stats, f)
+        else:
+            print(f"Loading spatial train stats from {train_feat_path}")
+            with open(train_feat_path, 'rb') as f:
+                feature_stats = pickle.load(f)
+
+        for idx, (x, _, _) in enumerate(tqdm(test_loader)):
+            x = x.to(device)
+            with torch.no_grad():
+                feats = model.extract_features_spatial(x)
+
+            score_maps = []
+
+            for level, f in enumerate(feats):
+                f = f.squeeze(0).cpu().numpy()  # (C, H, W)
+                C, H, W = f.shape
+                f = f.reshape(C, -1).T  # (H*W, C)
+
+                mean, inv_cov = feature_stats[level]
+                dists = [mahalanobis(pix, mean, inv_cov) for pix in f]
+                dists = np.array(dists).reshape(H, W)
+                score_maps.append(cv2.resize(dists, (x.shape[3], x.shape[2])))
+
+            total_score_map = np.sum(np.stack(score_maps), axis=0)
+            overlay = generate_heatmap_overlay(x.squeeze(0).cpu(), total_score_map, imagenet_mean, imagenet_std)
+            cv2.imwrite(os.path.join(save_dir, f'{idx:03d}_overlay.png'), overlay)
 
 if __name__ == '__main__':
     main()
