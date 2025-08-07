@@ -2,3 +2,8 @@
 *.txt
 *.pyc
 *.pkl
+*.png
+*.jpg
+*.jpeg
+*learning
+*data

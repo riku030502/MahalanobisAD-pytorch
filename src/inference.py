@@ -11,47 +11,46 @@ from sklearn.metrics import roc_auc_score
 from sklearn.metrics import roc_curve, auc
 from tqdm import tqdm
 import time
+import pickle
+import joblib
+
 
 from escnn import gspaces
 from escnn import nn as enn
 
 
-# ---------- ESCNNを用いた等変量特徴抽出器 ----------
+# --- 学習時と同じ特徴抽出モデル ---
 class EquivariantFeatureExtractor(torch.nn.Module):
-    def __init__(self, N=8):  # N-fold 回転対称性
+    def __init__(self, N=8):
         super().__init__()
         r2_act = gspaces.rot2dOnR2(N)
         in_type = enn.FieldType(r2_act, [r2_act.trivial_repr])
-        
         self.input_type = in_type
         self.block1 = enn.R2Conv(in_type,
                                  enn.FieldType(r2_act, 8 * [r2_act.regular_repr]),
                                  kernel_size=7,
                                  padding=3,
-                                 stride=2,  # ← ストライド2
+                                 stride=2,
                                  bias=False)
         self.relu1 = enn.ReLU(self.block1.out_type, inplace=True)
-
         self.block2 = enn.R2Conv(self.relu1.out_type,
                                  enn.FieldType(r2_act, 16 * [r2_act.regular_repr]),
                                  kernel_size=5,
                                  padding=2,
-                                 stride=2,  # ← ストライド2
+                                 stride=2,
                                  bias=False)
         self.relu2 = enn.ReLU(self.block2.out_type, inplace=True)
-
         self.block3 = enn.R2Conv(self.relu2.out_type,
                                  enn.FieldType(r2_act, 32 * [r2_act.regular_repr]),
                                  kernel_size=3,
                                  padding=1,
-                                 stride=2,  # ← ストライド2
+                                 stride=2,
                                  bias=False)
         self.relu3 = enn.ReLU(self.block3.out_type, inplace=True)
-
         self.out_type = self.relu3.out_type
 
     def forward(self, x):
-        x = x.unsqueeze(1)  # [B, 1, H, W]
+        x = x.unsqueeze(1)
         x = enn.GeometricTensor(x, self.input_type)
         x = self.block1(x)
         x = self.relu1(x)
@@ -59,81 +58,22 @@ class EquivariantFeatureExtractor(torch.nn.Module):
         x = self.relu2(x)
         x = self.block3(x)
         x = self.relu3(x)
-        return x.tensor  # [B, C, 28, 28] になるはず
+        return x.tensor
     
 
-# # ---------- CNN特徴抽出器 ----------
-# class FeatureExtractor(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         model = models.resnet18(pretrained=True)
-#         self.features = nn.Sequential(*list(model.children())[:6])  # conv1〜layer2
 
-#     def forward(self, x):
-#         return self.features(x)  # [B, C, H, W]
-
-
-# ---------- 正常画像読み込み ----------
-def load_images_from_folder(folder, img_size=(224, 224), max_images=300):
-    images = []
-    for filename in sorted(os.listdir(folder)):
-        if filename.endswith((".png", ".jpg")):
-            img_path = os.path.join(folder, filename)
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            if img is not None:
-                img = cv2.resize(img, img_size)
-                images.append(img)
-                if len(images) >= max_images:
-                    break
-    return images
-
-
-# ---------- 特徴抽出 ----------
-def extract_features(images, model, device):
-    model.eval()
-    features_by_position = {}
-    for img in tqdm(images, desc="特徴抽出中"):
-        img_resized = cv2.resize(img, (224, 224))
-        tensor = transforms.ToTensor()(img_resized).to(device)  # shape: [1, 1, H, W]
-
-
-        with torch.no_grad():
-            feat = model(tensor)[0].cpu().numpy()
-
-        C, H, W = feat.shape
-        for i in range(H):
-            for j in range(W):
-                key = (i, j)
-                vec = feat[:, i, j]
-                features_by_position.setdefault(key, []).append(vec)
-
-    return features_by_position
-
-
-# ---------- PCA学習 ----------
-def train_pca_model(features_by_position, n_components=0.95):
-    pca_models = {}
-    mean_vectors = {}
-    total_positions = len(features_by_position)
-    #print(f"PCA学習開始: 全{total_positions}位置で処理を実施")
-
-    for i, (pos, features) in enumerate(features_by_position.items()):
-        #print(f"[{i+1}/{total_positions}] 位置 {pos} の特徴数: {len(features)}")
-        try:
-            X = np.array(features)
-            mean = np.mean(X, axis=0)
-            X_centered = X - mean
-            pca = PCA(n_components=n_components, svd_solver='full')
-            pca.fit(X_centered)
-            pca_models[pos] = pca
-            mean_vectors[pos] = mean
-            #print(f"  => PCA学習成功")
-        except Exception as e:
-            print(f"  => エラー発生: {e}")
-    
-    #print("PCA学習終了")
-    return pca_models, mean_vectors
-
+# ---------- 画像読み込み ----------
+def load_learning_results(category, save_root="/home/zin/kobayashi_ws/src/MahalanobisAD-pytorch/src/learning"):
+    save_dir = os.path.join(save_root, category)
+    with open(os.path.join(save_dir, "pca_models.pkl"), "rb") as f:
+        pca_models = pickle.load(f)
+    with open(os.path.join(save_dir, "mean_vectors.pkl"), "rb") as f:
+        mean_vectors = pickle.load(f)
+    npz_data = np.load(os.path.join(save_dir, "features_by_position.npz"))
+    features_by_position = {
+        tuple(map(int, key.split('_'))): npz_data[key] for key in npz_data.files
+    }
+    return pca_models, mean_vectors, features_by_position
 
 # ---------- 異常マップ算出 ----------
 def compute_anomaly_map(image, model, pca_models, mean_vectors, device):
@@ -253,42 +193,24 @@ def save_result_image(anomaly_map, original_img, save_path):
     overlay = cv2.addWeighted(cv2.cvtColor(original_img, cv2.COLOR_GRAY2BGR), 0.6, heatmap, 0.4, 0)
     cv2.imwrite(save_path, overlay)
 
-
 # ---------- メイン処理 ----------
 def main():
-    normal_folder = '/home/zin/kobayashi_ws/src/MahalanobisAD-pytorch/data/mvtec_anomaly_detection/screw/train/good'
-    test_folder = '/home/zin/kobayashi_ws/src/MahalanobisAD-pytorch/data/mvtec_anomaly_detection/screw/test/scratch_neck'
-    gt_folder = '/home/zin/kobayashi_ws/src/MahalanobisAD-pytorch/data/mvtec_anomaly_detection/screw/ground_truth/scratch_neck'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # --- 1. 学習結果ロード ---
+    category = "cable"  # 適切に変える
+    test_folder = '/home/zin/kobayashi_ws/src/MahalanobisAD-pytorch/data/mvtec_anomaly_detection/cable/test/bent_wire'
+    gt_folder = '/home/zin/kobayashi_ws/src/MahalanobisAD-pytorch/data/mvtec_anomaly_detection/cable/ground_truth/bent_wire'
     result_dir = './results'
     os.makedirs(result_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    print(f"[INFO] 使用デバイス: {device}\n")
-
-    print("[INFO] 正常画像読み込み...")
-    t1 = time.time()
-    normal_images = load_images_from_folder(normal_folder)
-    t2 = time.time()
-    print(f"[INFO] 読み込み枚数: {len(normal_images)}")
-    print(f"[TIME] 正常画像読み込み時間: {t2 - t1:.2f} 秒\n")
-
-    print("[INFO] 特徴抽出...")
-    model = EquivariantFeatureExtractor(N=8).to(device) 
-    t3 = time.time()
-    features = extract_features(normal_images, model, device)
-    t4 = time.time()
-    print(f"[TIME] 特徴抽出時間: {t4 - t3:.2f} 秒\n")
-
-    print("[INFO] PCA学習...")
-    t5 = time.time()
-    pca_models, mean_vectors = train_pca_model(features, n_components=0.97)
-    t6 = time.time()
-    print(f"[TIME] PCA学習時間: {t6 - t5:.2f} 秒\n")
-
-    total_preprocessing_time = (t2 - t1) + (t4 - t3) + (t6 - t5)
-    print(f"[TIME] 前処理合計時間（読み込み＋特徴抽出＋PCA学習）: {total_preprocessing_time:.2f} 秒\n")
-
+    pca_models, mean_vectors, features_by_position = load_learning_results(category)
+    
+    # --- 2. 特徴抽出モデルの準備 ---
+    model = EquivariantFeatureExtractor(N=8).to(device)
+    model.eval()
+    # 学習済み重みがあれば読み込み（例）
+    # model.load_state_dict(torch.load("path_to_trained_model.pth"))
+    
     test_files = sorted([f for f in os.listdir(test_folder) if f.endswith('.png') or f.endswith('.jpg')])
     auroc_scores = []
 
@@ -322,6 +244,5 @@ def main():
     
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
